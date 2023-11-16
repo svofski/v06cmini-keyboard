@@ -17,3 +17,11 @@ This keyboard is very small indeed.
 ![photo2](photo2.jpg)
 ![photo3](photo3.jpg)
 ![photo4](photo4.jpg)
+
+## Firmware
+
+### spislave
+
+[spislave](firmware/spislave) is the main intended use with [v06x-mini](https://github.com/svofski/v06x-tiny).
+
+
