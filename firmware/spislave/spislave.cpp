@@ -42,13 +42,35 @@ constexpr uint8_t PC_BIT_INDRUS_MASK = 1 << PC_BIT_INDRUS;
 
 std::array<uint8_t, 256> debug;
 volatile size_t debug_i = 0;
-uint8_t txbyte, rxbyte[4];
+uint8_t rxbyte[4];
+uint16_t txbyte;
+
+uint8_t last_cmd = 0;
 
 inline void select_columns(uint8_t w8)
 {
     gpio_put_masked(0xff00, w8 << 8);
 }
 
+// Boneheaded SPI slave on rp2040 doesn't allow more than one word
+// per CS assertion, so we must be smart and push everything in 16-bit frame
+//
+// The known workaround for this is to use SPI mode 3, but it has drawbacks.
+void __time_critical_func(reset_spi)()
+{
+    spi_init(SPI_PORT, 1000*1000);
+    spi_set_format(SPI_PORT, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST); 
+    spi_set_slave(SPI_PORT, true);
+}
+
+// Because rp2040 spi slave is completely broken and it hogs MISO wire
+// rely on MISO function switch in the interrupt. this introduces
+// a delay between CS and the first bit readable by master.
+//
+// Luckily Espressif engineers are not forked in the head and there is
+// a beautiful feature that lets compensate for for this nonsense,
+// spi_device_interface_config_t.cs_ena_pretrans lets CS to set up before
+// transmission starts, so we're golden.
 void __time_critical_func(spi_exchange)()
 {
     // prepare data
@@ -57,49 +79,40 @@ void __time_critical_func(spi_exchange)()
 
     // RUSLAT|US|SS|000|SBROS|VVOD
     uint8_t modkeys = ((all >> MODKEYS_LSB) & 7) << PC_MODKEYS_LSB;
+
     modkeys |= (1 & (all >> PIN_VVOD)) << 0;
     modkeys |= (1 & (all >> PIN_SBROS)) << 1;
 
     // 0: read command
-    txbyte = 0;
-    spi_write_read_blocking(SPI_PORT, &txbyte, &rxbyte[0], 1);
+    txbyte = (modkeys << 8) | rows;
+    
+    spi_get_hw(SPI_PORT)->dr = (uint32_t)txbyte; // prime up tx buffer
+                                                 //
+    while (!spi_is_readable(SPI_PORT)) 
+        tight_loop_contents();
+    rxbyte[2] = gpio_get(PIN_CS);
 
-    //printf("%02x ", rxbyte[0]);
+    *(uint16_t *)(&rxbyte[0]) = spi_get_hw(SPI_PORT)->dr;
 
-    // 1: send response
-    switch (rxbyte[0]) {
+    last_cmd = rxbyte[1];
+    switch (last_cmd) {
         case 0xe5:
-            // read column select
-            spi_write_read_blocking(SPI_PORT, &txbyte, &rxbyte[1], 1);
-            select_columns(rxbyte[1]);
+            // column select
+            select_columns(rxbyte[0]);
             break;
         case 0xe6:
-            // send rows
-            spi_write_read_blocking(SPI_PORT, &rows, &rxbyte[1], 1);
+            // send rows (primed)
             break;
         case 0xe7:
-            // read modkeys
-            spi_write_read_blocking(SPI_PORT, &modkeys, &rxbyte[1], 1);
+            // read modkeys (primed)
             break;
         case 0xe8:
             // set rus/lat
-            spi_write_read_blocking(SPI_PORT, &txbyte, &rxbyte[1], 1);
-            gpio_put(PIN_INDRUS, (rxbyte[1] >> PC_BIT_INDRUS) & 1);
+            gpio_put(PIN_INDRUS, (rxbyte[0] >> PC_BIT_INDRUS) & 1);
             break;
     }
+    rxbyte[3] = gpio_get(PIN_CS);
 
-    //putchar('2');
-
-    // 3: flush response
-    spi_write_read_blocking(SPI_PORT, &txbyte, &rxbyte[2], 1);
-    //while ((spi_get_hw(SPI_PORT)->sr & SPI_SSPSR_TFE_BITS) == 0) // while transmit fifo not empty
-    //    tight_loop_contents();
-    //while (spi_is_readable(SPI_PORT)) {
-    //    rxbyte[3] = (uint8_t)spi_get_hw(SPI_PORT)->dr;
-    //}
-
-
-    rxbyte[3] = 0x33;
     for (size_t i = 0; i < 4; ++i) {
         if (debug_i < debug.size()) {
             debug[debug_i++] = rxbyte[i];
@@ -107,22 +120,49 @@ void __time_critical_func(spi_exchange)()
     }
 }
 
-void core1_task()
+
+// status reg is found once in prepare_soup()
+static io_ro_32 *status_reg_cs;
+
+void prepare_soup()
 {
-    spi_init(SPI_PORT, 6000*1000);
-    spi_set_format(SPI_PORT, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST); 
-    spi_set_slave(SPI_PORT, true);
-    for(;;) {
-        spi_exchange();
-        // if we receive strange crap, fix it with a reset
-        if (rxbyte[0] != 0xe5 && rxbyte[0] != 0xe6 && rxbyte[0] != 0xe7 && rxbyte[0] != 0xe8) {
-            spi_init(SPI_PORT, 1000*1000);
-            spi_set_format(SPI_PORT, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST); 
-            spi_set_slave(SPI_PORT, true);
+    io_irq_ctrl_hw_t *irq_ctrl_base = get_core_num() ? &iobank0_hw->proc1_irq_ctrl : &iobank0_hw->proc0_irq_ctrl;
+    status_reg_cs = &irq_ctrl_base->ints[PIN_CS / 8];
+}
+
+void __time_critical_func(miso_soup)(void)
+{
+    // see prepare_soup()
+    // io_irq_ctrl_hw_t *irq_ctrl_base = get_core_num() ? &iobank0_hw->proc1_irq_ctrl : &iobank0_hw->proc0_irq_ctrl;
+    // io_ro_32 *status_reg_cs = &irq_ctrl_base->ints[PIN_CS / 8];
+
+    uint events = (*status_reg_cs >> 4 * (PIN_CS % 8)) & 0xf;
+    if (events) {
+        if (events & GPIO_IRQ_EDGE_FALL) {
+            gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
         }
+        else if (events & GPIO_IRQ_EDGE_RISE) {
+            gpio_set_function(PIN_MISO, GPIO_FUNC_SIO);
+        }
+        gpio_acknowledge_irq(PIN_CS, events);
     }
 }
 
+void __time_critical_func(core1_task)()
+{
+
+    reset_spi();
+
+    for(;;) {
+        spi_exchange();
+
+        // if we receive strange crap, fix it with a reset
+        if (last_cmd != 0xe5 && last_cmd != 0xe6 && last_cmd != 0xe7 && last_cmd != 0xe8) {
+            printf("last_cmd=%02x, reset\n", last_cmd);
+            reset_spi();
+        }
+    }
+}
 
 int main()
 {
@@ -153,19 +193,22 @@ int main()
 
 
     spi_init(SPI_PORT, 6000*1000);
-    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_CS,   GPIO_FUNC_SIO);
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SIO);
+    //gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_CS,   GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
 
-    // THIS LINE IS ABSOLUTELY KEY. Enables multi-byte transfers with one CS assert
-    // Page 537 of the RP2040 Datasheet.
-    spi_set_format(SPI_PORT, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST); 
-    spi_set_slave(SPI_PORT, true);
 
-    gpio_set_dir(PIN_CS, GPIO_IN);
-    gpio_disable_pulls(PIN_CS);
+    // manually switch off MISO
+    gpio_set_irq_enabled(PIN_CS,  GPIO_IRQ_EDGE_FALL,true);
+    gpio_set_irq_enabled(PIN_CS,  GPIO_IRQ_EDGE_RISE, true);
+    irq_set_exclusive_handler(IO_IRQ_BANK0, miso_soup);
 
+    prepare_soup();
+    irq_set_enabled(IO_IRQ_BANK0, true);
+
+    reset_spi();
 
     multicore_launch_core1(core1_task);
 
